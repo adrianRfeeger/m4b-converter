@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import argparse
 import ctypes
@@ -43,6 +43,13 @@ def run_command(log, cmdstr, values, action, ignore_errors=False, **kwargs):
         cmd.append(opt % values)
     proc = subprocess.Popen(cmd, **kwargs)
     (stdout, output) = proc.communicate()
+    
+    # Decode output if it is bytes
+    if output and isinstance(output, bytes):
+        output = output.decode('utf-8', errors='ignore')
+    if stdout and isinstance(stdout, bytes):
+        stdout = stdout.decode('utf-8', errors='ignore') # Although run_command returns 'output' which is usually stderr in usage below
+
     if not ignore_errors and not proc.returncode == 0:
         msg = dedent('''
             An error occurred while %s.
@@ -52,7 +59,7 @@ def run_command(log, cmdstr, values, action, ignore_errors=False, **kwargs):
             %s''')
         log.error(msg % (action, cmdstr % values, proc.returncode, output))
         sys.exit(1)
-    return output
+    return output if output else stdout # Return whatever was captured, preferring stderr (logic from original)
 
 def parse_args():
     """Parse command line arguments."""
@@ -74,8 +81,10 @@ def parse_args():
     parser.add_argument('--pipe-wav', action='store_true', help='pipe wav to encoder')
     parser.add_argument('--skip-encoding', action='store_true',
                         help='do not encode audio (keep as .mp4)')
-    parser.add_argument('--no-mp4v2', action='store_true',
-                        help='use ffmpeg to retrieve chapters (not recommended)')
+    parser.add_argument('--no-mp4v2', action='store_true', default=True,
+                        help='use ffmpeg to retrieve chapters (default on this version)')
+    parser.add_argument('--assume-yes', action='store_true',
+                        help='assume yes to all prompts (non-interactive mode)')
     parser.add_argument('--debug', action='store_true',
                         help='output debug messages and save to log file')
     parser.add_argument('filename', help='m4b file(s) to be converted', nargs='+')
@@ -139,11 +148,23 @@ def ffmpeg_metadata(args, log, filename):
     cmd = '%(ffmpeg)s -i %(infile)s'
     log.debug('Retrieving metadata from output of command: %s' % (cmd % values))
 
+    # ffmpeg writes to stderr
     output = run_command(log, cmd, values, 'retrieving metadata from ffmpeg output',
         ignore_errors=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    raw_metadata = (output.split("    Chapter ")[0]).split('Input #')[1]
-    raw_chapters = output.split("    Chapter ")[1:]
+    if not output:
+        output = ""
+
+    if "Chapter " in output:
+        raw_metadata = (output.split("    Chapter ")[0]).split('Input #')[1]
+        raw_chapters = output.split("    Chapter ")[1:]
+    else:
+        # Fallback if no chapters or different format, try to parse what we have for duration/bitrate
+        if 'Input #' in output:
+             raw_metadata = output.split('Input #')[1]
+        else:
+             raw_metadata = output
+        raw_chapters = []
 
     # Parse stream and metadata
     re_stream = re.compile(r'[\s]+Stream .*: Audio: .*, ([\d]+) Hz, .*, .*, ([\d]+) kb\/s')
@@ -151,7 +172,10 @@ def ffmpeg_metadata(args, log, filename):
 
     try:
         stream = re_stream.search(output)
-        sample_rate, bit_rate = int(stream.group(1)), int(stream.group(2))
+        if stream:
+            sample_rate, bit_rate = int(stream.group(1)), int(stream.group(2))
+        else:
+            sample_rate, bit_rate = 44100, 64
     except Exception:
         sample_rate, bit_rate = 44100, 64
 
@@ -163,22 +187,24 @@ def ffmpeg_metadata(args, log, filename):
                 metadata['duration'] = m.group(1).strip()
                 metadata['start'] = m.group(2).strip()
         else:
-            key = (meta.split(':')[0]).strip()
-            value = (':'.join(meta.split(':')[1:])).strip()
-            metadata[key] = value
+            if ':' in meta:
+                key = (meta.split(':')[0]).strip()
+                value = (':'.join(meta.split(':')[1:])).strip()
+                metadata[key] = value
 
     # Parse chapters
-    re_chapter = re.compile('^#[\d\.]+: start ([\d|\.]+), end ([\d|\.]+)[\s]+Metadata:[\s]+title[\s]+: (.*)')
+    re_chapter = re.compile(r'^#[\d\.]+: start ([\d|\.]+), end ([\d|\.]+)[\s]+Metadata:[\s]+title[\s]+: (.*)')
     n = 1
     for raw_chapter in raw_chapters:
         m = re.match(re_chapter, raw_chapter.strip())
-        start = float(m.group(1)) * 1000
-        e = float(m.group(2)) * 1000
-        duration = e - start
-        title = unicode(m.group(3), errors='ignore').strip()
-        chapter = Chapter(num=n, title=title, start=start, end=e)
-        chapters.append(chapter)
-        n += 1
+        if m:
+            start = float(m.group(1)) * 1000
+            e = float(m.group(2)) * 1000
+            duration = e - start
+            title = m.group(3).strip()
+            chapter = Chapter(num=n, title=title, start=start, end=e)
+            chapters.append(chapter)
+            n += 1
 
     return chapters, sample_rate, bit_rate, metadata
 
@@ -224,7 +250,10 @@ def show_metadata_info(args, log, chapters, sample_rate, bit_rate, metadata):
     if args.no_mp4v2 and not chapters:
         log.warning("No chapters were found. There may be chapters present but ffmpeg can't read them. Try to enable mp4v2.")
         log.info('Do you want to continue? (y/N)')
-        cont = raw_input('> ')
+        if args.assume_yes:
+            cont = 'y'
+        else:
+            cont = input('> ')
         if not cont.lower().startswith('y'):
             sys.exit(1)
 
@@ -250,7 +279,10 @@ def encode(args, log, output_dir, temp_dir, filename, basename, sample_rate, bit
 
     if os.path.isfile(encoded_file):
         log.info("Found a previously encoded file '%s'. Do you want to re-encode it? (y/N/q)" % encoded_file)
-        i = raw_input('> ')
+        if args.assume_yes:
+            i = 'y'
+        else:
+            i = input('> ')
         if i.lower().startswith('q'):
             sys.exit(0)
         elif not i.lower() == 'y':
@@ -281,13 +313,12 @@ def split(args, log, output_dir, encoded_file, chapters):
     necessary on other platforms.
     """
     re_format = re.compile(r'%\(([A-Za-z0-9]+)\)')
-    re_sub = re.compile(r'[\\\*\?\"\<\>\|]+')
+    re_sub = re.compile(r'[\\*?"<>|]+')
 
     for chapter in chapters:
         values = dict(num=chapter.num, title=chapter.title, start=chapter.start, end=chapter.end, duration=chapter.duration())
         chapter_name = re_sub.sub('', (args.custom_name % values).replace('/', '-').replace(':', '-'))
-        if not isinstance(chapter_name, unicode):
-            chapter_name = unicode(chapter_name, 'utf-8')
+        # Py3: strings are unicode by default
 
         if sys.platform.startswith('win'):
             fname = os.path.join(output_dir, '_tmp_%d.%s' % (chapter.num, args.ext))

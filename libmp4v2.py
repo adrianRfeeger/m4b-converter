@@ -13,6 +13,25 @@ elif sys.platform.startswith('win'):
     if not os.path.isfile(p):
         p = 'libmp4v2.dll'
     dll = ctypes.CDLL(p)
+elif sys.platform.startswith('darwin'):
+    try:
+        dll = ctypes.CDLL('libmp4v2.dylib')
+    except OSError:
+        try:
+            dll = ctypes.CDLL('/usr/local/lib/libmp4v2.dylib')
+        except OSError:
+            try:
+                dll = ctypes.CDLL('libmp4v2.0.dylib')
+            except OSError:
+                 # Raise a helpful error instead of letting ctypes crash
+                 # This allows the caller (if they were catching it) or the user to know what's wrong.
+                 # Since this is top-level code, it will crash the import.
+                 # We can let it crash but maybe print a suggestion?
+                 # Or we can set dll to None and check it later.
+                 # But the rest of the file relies on 'dll' to define functions.
+                 # So we must raise or exit.
+                 sys.stderr.write("Error: libmp4v2 not found. Please install it (e.g. 'brew install mp4v2') or use the '--no-mp4v2' option to use ffmpeg instead.\n")
+                 raise
 else:
     raise NotImplementedError('O/S %r not supported' % sys.platform)
 
@@ -29,7 +48,7 @@ class _Enum(ctypes.c_ulong):
 
     def __eq__(self, other):
         return ( (isinstance(other, _Enum)       and self.value == other.value)
-              or (isinstance(other, (int, long)) and self.value == other) )
+              or (isinstance(other, int) and self.value == other) )
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -59,6 +78,8 @@ class MP4File:
     '''
     def __init__(self, filename):
         self.filename = filename
+        if isinstance(self.filename, str):
+            self.filename = self.filename.encode('utf-8')
         self.handle = MP4Read(self.filename, 0)
 
     def load_meta(self):
@@ -82,7 +103,11 @@ class MP4File:
         start = 0
         chapters = []
         for n in range(0, chapter_count.value):
-            c = Chapter(title=chapter_list[n].title,
+            title = chapter_list[n].title
+            if isinstance(title, bytes):
+                title = title.decode('utf-8', errors='ignore')
+            
+            c = Chapter(title=title,
                         start=start,
                         end=start+int(chapter_list[n].duration),
                         num=n+1)
@@ -97,6 +122,8 @@ class MP4File:
         tracks_count = MP4GetNumberOfTracks(self.handle, None, 0)
         for n in range(1, tracks_count+1):
             tt = MP4GetTrackType(self.handle, n)
+            if isinstance(tt, bytes):
+                tt = tt.decode('utf-8')
             if tt == 'soun':
                 return n
         raise Exception('No audio track found.')
